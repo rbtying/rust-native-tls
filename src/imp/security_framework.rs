@@ -5,6 +5,7 @@ extern crate tempdir;
 
 use self::security_framework::base;
 use self::security_framework::certificate::SecCertificate;
+use self::security_framework::cipher_suite::CipherSuite;
 use self::security_framework::identity::SecIdentity;
 use self::security_framework::import_export::{Pkcs12ImportOptions, ImportedIdentityOptions};
 use self::security_framework::secure_transport::{self, SslContext, ProtocolSide, ConnectionType,
@@ -24,6 +25,7 @@ use self::security_framework::os::macos::import_export::{SecItems, ImportOptions
 #[cfg(not(target_os = "ios"))]
 use self::security_framework_sys::base::errSecParam;
 
+use Algorithm;
 use Protocol;
 
 static SET_AT_EXIT: Once = ONCE_INIT;
@@ -31,6 +33,21 @@ static SET_AT_EXIT: Once = ONCE_INIT;
 #[cfg(not(target_os = "ios"))]
 lazy_static! {
     static ref TEMP_KEYCHAIN: Mutex<Option<(SecKeychain, TempDir)>> = Mutex::new(None);
+    pub static ref CIPHERS_3DES: Vec<CipherSuite> = vec![
+        CipherSuite::TLS_ECDH_ECDSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_ECDH_RSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_DH_DSS_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_DH_RSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_DHE_DSS_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_PSK_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_DHE_PSK_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::TLS_RSA_PSK_WITH_3DES_EDE_CBC_SHA,
+        CipherSuite::SSL_RSA_WITH_3DES_EDE_CBC_MD5,
+    ].into_iter().collect();
 }
 
 fn convert_protocol(protocol: Protocol) -> SslProtocol {
@@ -55,6 +72,18 @@ fn protocol_min_max(protocols: &[Protocol]) -> (SslProtocol, SslProtocol) {
         }
     }
     (convert_protocol(min), convert_protocol(max))
+}
+
+fn expand_algorithms(algos: Vec<Algorithm>) -> Vec<CipherSuite> {
+    let mut all_ciphers = Vec::new();
+    for algo in algos {
+        let ciphers = match algo {
+            Algorithm::Des3 => CIPHERS_3DES.clone(),
+            Algorithm::__NonExhaustive => unreachable!(),
+        };
+        all_ciphers.extend(ciphers);
+    }
+    all_ciphers
 }
 
 pub struct Error(base::Error);
@@ -293,6 +322,21 @@ impl TlsConnectorBuilder {
     pub fn build(self) -> Result<TlsConnector, Error> {
         Ok(self.0)
     }
+
+    pub fn disable_built_in_certs(&mut self) -> Result<(), Error> {
+        self.0.disable_built_in_roots = true;
+        Ok(())
+    }
+
+    pub fn whitelist_algorithms(&mut self, algos: &[Algorithm]) -> Result<(), Error> {
+        self.0.algo_whitelist = algos.to_vec();
+        Ok(())
+    }
+
+    pub fn blacklist_algorithms(&mut self, algos: &[Algorithm]) -> Result<(), Error> {
+        self.0.algo_blacklist = algos.to_vec();
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -300,6 +344,9 @@ pub struct TlsConnector {
     pkcs12: Option<Pkcs12>,
     protocols: Vec<Protocol>,
     roots: Vec<SecCertificate>,
+    disable_built_in_roots: bool,
+    algo_whitelist: Vec<Algorithm>,
+    algo_blacklist: Vec<Algorithm>,
 }
 
 impl TlsConnector {
@@ -308,6 +355,9 @@ impl TlsConnector {
             pkcs12: None,
             protocols: vec![Protocol::Tlsv10, Protocol::Tlsv11, Protocol::Tlsv12],
             roots: vec![],
+            disable_built_in_roots: false,
+            algo_whitelist: vec![],
+            algo_blacklist: vec![],
         }))
     }
 
@@ -341,6 +391,9 @@ impl TlsConnector {
             builder.identity(&pkcs12.identity, &pkcs12.chain);
         }
         builder.anchor_certificates(&self.roots);
+        builder.trust_anchor_certificates_only(self.disable_built_in_roots);
+        builder.whitelist_ciphers(&expand_algorithms(self.algo_whitelist.clone()));
+        builder.blacklist_ciphers(&expand_algorithms(self.algo_blacklist.clone()));
 
         let r = match domain {
             Some(domain) => builder.handshake2(domain, stream),
